@@ -233,10 +233,12 @@ impl Device {
             can_pause,
         };
 
-        if let Err(desc) = check_errors(unsafe { alsa::snd_pcm_start(handle) }) {
-            let description = format!("could not start stream: {}", desc);
-            let err = BackendSpecificError { description };
-            return Err(err.into());
+        if stream_type == alsa::_snd_pcm_stream::SND_PCM_STREAM_CAPTURE {
+            if let Err(desc) = check_errors(unsafe { alsa::snd_pcm_start(handle) }) {
+                let description = format!("could not start stream: {}", desc);
+                let err = BackendSpecificError { description };
+                return Err(err.into());
+            }
         }
 
         Ok(stream_inner)
@@ -778,10 +780,10 @@ fn process_output(
                 available_frames as alsa::snd_pcm_uframes_t,
             )
         };
-        if result == -(alsa::EPIPE as i64) {
+        if result == -(alsa::EPIPE as alsa::snd_pcm_sframes_t) {
             // buffer underrun
             // TODO: Notify the user of this.
-            unsafe { alsa::snd_pcm_recover(stream.channel, result as i32, 0) };
+            unsafe { alsa::snd_pcm_recover(stream.channel, result as raw::c_int, 0) };
         } else if let Err(err) = check_errors(result as _) {
             let description = format!("`snd_pcm_writei` failed: {}", err);
             error_callback(BackendSpecificError { description }.into());
