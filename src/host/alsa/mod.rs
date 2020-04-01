@@ -691,14 +691,11 @@ fn poll_descriptors_and_prepare_buffer(
         return PollDescriptorsFlow::Return;
     }
 
-    let stream_type = match check_for_pollout_or_pollin(stream, descriptors[1..].as_mut_ptr()) {
-        Ok(Some(ty)) => ty,
-        Ok(None) => {
+    let stream_type = match descriptors[1].revents {
+        libc::POLLOUT => StreamType::Output,
+        libc::POLLIN => StreamType::Input,
+        _ => {
             // Nothing to process, poll again
-            return PollDescriptorsFlow::Continue;
-        }
-        Err(err) => {
-            error_callback(err.into());
             return PollDescriptorsFlow::Continue;
         }
     };
@@ -870,42 +867,6 @@ impl StreamTrait for Stream {
         }
         // TODO: error handling
         Ok(())
-    }
-}
-
-// Check whether the event is `POLLOUT` or `POLLIN`.
-//
-// If so, return the stream type associated with the event.
-//
-// Otherwise, returns `Ok(None)`.
-//
-// Returns an `Err` if the `snd_pcm_poll_descriptors_revents` call fails.
-fn check_for_pollout_or_pollin(
-    stream: &StreamInner,
-    stream_descriptor_ptr: *mut libc::pollfd,
-) -> Result<Option<StreamType>, BackendSpecificError> {
-    let (revent, res) = unsafe {
-        let mut revent = 0;
-        let res = alsa::snd_pcm_poll_descriptors_revents(
-            stream.channel,
-            stream_descriptor_ptr,
-            stream.num_descriptors as raw::c_uint,
-            &mut revent,
-        );
-        (revent, res)
-    };
-    if let Err(desc) = check_errors(res) {
-        let description = format!("`snd_pcm_poll_descriptors_revents` failed: {}", desc);
-        let err = BackendSpecificError { description };
-        return Err(err);
-    }
-
-    if revent as libc::c_short == libc::POLLOUT {
-        Ok(Some(StreamType::Output))
-    } else if revent as libc::c_short == libc::POLLIN {
-        Ok(Some(StreamType::Input))
-    } else {
-        Ok(None)
     }
 }
 
