@@ -1,4 +1,5 @@
 extern crate alsa_sys as alsa;
+extern crate libc;
 
 use crate::{
     BackendSpecificError, BuildStreamError, ChannelCount, Data, DefaultStreamConfigError,
@@ -95,7 +96,7 @@ impl DeviceTrait for Device {
         let stream_inner = self.build_stream_inner(
             conf,
             sample_format,
-            alsa::_snd_pcm_stream::SND_PCM_STREAM_CAPTURE,
+            alsa::SND_PCM_STREAM_CAPTURE,
         )?;
         let stream = Stream::new_input(Arc::new(stream_inner), data_callback, error_callback);
         Ok(stream)
@@ -115,7 +116,7 @@ impl DeviceTrait for Device {
         let stream_inner = self.build_stream_inner(
             conf,
             sample_format,
-            alsa::_snd_pcm_stream::SND_PCM_STREAM_PLAYBACK,
+            alsa::SND_PCM_STREAM_PLAYBACK,
         )?;
         let stream = Stream::new_output(Arc::new(stream_inner), data_callback, error_callback);
         Ok(stream)
@@ -129,7 +130,7 @@ struct TriggerReceiver(raw::c_int);
 impl TriggerSender {
     fn wakeup(&self) {
         let buf = 1u64;
-        let ret = unsafe { alsa::write(self.0, &buf as *const u64 as *const _, 8) };
+        let ret = unsafe { libc::write(self.0, &buf as *const u64 as *const _, 8) };
         assert!(ret == 8);
     }
 }
@@ -137,14 +138,14 @@ impl TriggerSender {
 impl TriggerReceiver {
     fn clear_pipe(&self) {
         let mut out = 0u64;
-        let ret = unsafe { alsa::read(self.0, &mut out as *mut u64 as *mut _, 8) };
+        let ret = unsafe { libc::read(self.0, &mut out as *mut u64 as *mut _, 8) };
         assert_eq!(ret, 8);
     }
 }
 
 fn trigger() -> (TriggerSender, TriggerReceiver) {
     let mut fds = [0, 0];
-    match unsafe { alsa::pipe(fds.as_mut_ptr()) } {
+    match unsafe { libc::pipe(fds.as_mut_ptr()) } {
         0 => (TriggerSender(fds[1]), TriggerReceiver(fds[0])),
         _ => panic!("Could not create pipe"),
     }
@@ -153,7 +154,7 @@ fn trigger() -> (TriggerSender, TriggerReceiver) {
 impl Drop for TriggerSender {
     fn drop(&mut self) {
         unsafe {
-            alsa::close(self.0);
+            libc::close(self.0);
         }
     }
 }
@@ -161,7 +162,7 @@ impl Drop for TriggerSender {
 impl Drop for TriggerReceiver {
     fn drop(&mut self) {
         unsafe {
-            alsa::close(self.0);
+            libc::close(self.0);
         }
     }
 }
@@ -233,7 +234,7 @@ impl Device {
             can_pause,
         };
 
-        if stream_type == alsa::_snd_pcm_stream::SND_PCM_STREAM_CAPTURE {
+        if stream_type == alsa::SND_PCM_STREAM_CAPTURE {
             if let Err(desc) = check_errors(unsafe { alsa::snd_pcm_start(handle) }) {
                 let description = format!("could not start stream: {}", desc);
                 let err = BackendSpecificError { description };
@@ -293,12 +294,12 @@ impl Device {
             //SND_PCM_FORMAT_U8,
             (
                 SampleFormat::I16,
-                alsa::_snd_pcm_format::SND_PCM_FORMAT_S16_LE,
+                alsa::SND_PCM_FORMAT_S16_LE,
             ),
             //SND_PCM_FORMAT_S16_BE,
             (
                 SampleFormat::U16,
-                alsa::_snd_pcm_format::SND_PCM_FORMAT_U16_LE,
+                alsa::SND_PCM_FORMAT_U16_LE,
             ),
             //SND_PCM_FORMAT_U16_BE,
             //SND_PCM_FORMAT_S24_LE,
@@ -311,7 +312,7 @@ impl Device {
             //SND_PCM_FORMAT_U32_BE,
             (
                 SampleFormat::F32,
-                alsa::_snd_pcm_format::SND_PCM_FORMAT_FLOAT_LE,
+                alsa::SND_PCM_FORMAT_FLOAT_LE,
             ),
             //SND_PCM_FORMAT_FLOAT_BE,
             //SND_PCM_FORMAT_FLOAT64_LE,
@@ -446,13 +447,13 @@ impl Device {
     fn supported_input_configs(
         &self,
     ) -> Result<SupportedInputConfigs, SupportedStreamConfigsError> {
-        unsafe { self.supported_configs(alsa::_snd_pcm_stream::SND_PCM_STREAM_CAPTURE) }
+        unsafe { self.supported_configs(alsa::SND_PCM_STREAM_CAPTURE) }
     }
 
     fn supported_output_configs(
         &self,
     ) -> Result<SupportedOutputConfigs, SupportedStreamConfigsError> {
-        unsafe { self.supported_configs(alsa::_snd_pcm_stream::SND_PCM_STREAM_PLAYBACK) }
+        unsafe { self.supported_configs(alsa::SND_PCM_STREAM_PLAYBACK) }
     }
 
     // ALSA does not offer default stream formats, so instead we compare all supported formats by
@@ -496,11 +497,11 @@ impl Device {
     }
 
     fn default_input_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
-        self.default_config(alsa::_snd_pcm_stream::SND_PCM_STREAM_CAPTURE)
+        self.default_config(alsa::SND_PCM_STREAM_CAPTURE)
     }
 
     fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
-        self.default_config(alsa::_snd_pcm_stream::SND_PCM_STREAM_PLAYBACK)
+        self.default_config(alsa::SND_PCM_STREAM_PLAYBACK)
     }
 }
 
@@ -553,7 +554,7 @@ pub struct Stream {
 
 #[derive(Default)]
 struct StreamWorkerContext {
-    descriptors: Vec<alsa::pollfd>,
+    descriptors: Vec<libc::pollfd>,
     buffer: Vec<u8>,
 }
 
@@ -645,9 +646,9 @@ fn poll_descriptors_and_prepare_buffer(
     descriptors.clear();
 
     // Add the self-pipe for signaling termination.
-    descriptors.push(alsa::pollfd {
+    descriptors.push(libc::pollfd {
         fd: rx.0,
-        events: alsa::POLLIN as raw::c_short,
+        events: libc::POLLIN as raw::c_short,
         revents: 0,
     });
 
@@ -668,9 +669,9 @@ fn poll_descriptors_and_prepare_buffer(
 
     let res = unsafe {
         // Don't timeout, wait forever.
-        alsa::poll(
+        libc::poll(
             descriptors.as_mut_ptr(),
-            descriptors.len() as alsa::nfds_t,
+            descriptors.len() as libc::nfds_t,
             -1,
         )
     };
@@ -780,7 +781,7 @@ fn process_output(
                 available_frames as alsa::snd_pcm_uframes_t,
             )
         };
-        if result == -(alsa::EPIPE as alsa::snd_pcm_sframes_t) {
+        if result == -(libc::EPIPE as alsa::snd_pcm_sframes_t) {
             // buffer underrun
             // TODO: Notify the user of this.
             unsafe { alsa::snd_pcm_recover(stream.channel, result as raw::c_int, 0) };
@@ -881,7 +882,7 @@ impl StreamTrait for Stream {
 // Returns an `Err` if the `snd_pcm_poll_descriptors_revents` call fails.
 fn check_for_pollout_or_pollin(
     stream: &StreamInner,
-    stream_descriptor_ptr: *mut alsa::pollfd,
+    stream_descriptor_ptr: *mut libc::pollfd,
 ) -> Result<Option<StreamType>, BackendSpecificError> {
     let (revent, res) = unsafe {
         let mut revent = 0;
@@ -899,9 +900,9 @@ fn check_for_pollout_or_pollin(
         return Err(err);
     }
 
-    if revent as u32 == alsa::POLLOUT {
+    if revent as libc::c_short == libc::POLLOUT {
         Ok(Some(StreamType::Output))
-    } else if revent as u32 == alsa::POLLIN {
+    } else if revent as libc::c_short == libc::POLLIN {
         Ok(Some(StreamType::Input))
     } else {
         Ok(None)
@@ -936,22 +937,22 @@ unsafe fn set_hw_params_from_format(
     if let Err(e) = check_errors(alsa::snd_pcm_hw_params_set_access(
         pcm_handle,
         hw_params.0,
-        alsa::_snd_pcm_access::SND_PCM_ACCESS_RW_INTERLEAVED,
+        alsa::SND_PCM_ACCESS_RW_INTERLEAVED,
     )) {
         return Err(format!("handle not acessible: {}", e));
     }
 
     let sample_format = if cfg!(target_endian = "big") {
         match sample_format {
-            SampleFormat::I16 => alsa::_snd_pcm_format::SND_PCM_FORMAT_S16_BE,
-            SampleFormat::U16 => alsa::_snd_pcm_format::SND_PCM_FORMAT_U16_BE,
-            SampleFormat::F32 => alsa::_snd_pcm_format::SND_PCM_FORMAT_FLOAT_BE,
+            SampleFormat::I16 => alsa::SND_PCM_FORMAT_S16_BE,
+            SampleFormat::U16 => alsa::SND_PCM_FORMAT_U16_BE,
+            SampleFormat::F32 => alsa::SND_PCM_FORMAT_FLOAT_BE,
         }
     } else {
         match sample_format {
-            SampleFormat::I16 => alsa::_snd_pcm_format::SND_PCM_FORMAT_S16_LE,
-            SampleFormat::U16 => alsa::_snd_pcm_format::SND_PCM_FORMAT_U16_LE,
-            SampleFormat::F32 => alsa::_snd_pcm_format::SND_PCM_FORMAT_FLOAT_LE,
+            SampleFormat::I16 => alsa::SND_PCM_FORMAT_S16_LE,
+            SampleFormat::U16 => alsa::SND_PCM_FORMAT_U16_LE,
+            SampleFormat::F32 => alsa::SND_PCM_FORMAT_FLOAT_LE,
         }
     };
 

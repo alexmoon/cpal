@@ -114,7 +114,7 @@ impl Iterator for Devices {
                 let has_available_output = alsa::snd_pcm_open(
                     &mut playback_handle,
                     name_zeroed.as_ptr() as *const _,
-                    alsa::_snd_pcm_stream::SND_PCM_STREAM_PLAYBACK,
+                    alsa::SND_PCM_STREAM_PLAYBACK,
                     alsa::SND_PCM_NONBLOCK as raw::c_int,
                 ) == 0;
                 if has_available_output {
@@ -126,7 +126,7 @@ impl Iterator for Devices {
                 let has_available_input = alsa::snd_pcm_open(
                     &mut capture_handle,
                     name_zeroed.as_ptr() as *const _,
-                    alsa::_snd_pcm_stream::SND_PCM_STREAM_CAPTURE,
+                    alsa::SND_PCM_STREAM_CAPTURE,
                     alsa::SND_PCM_NONBLOCK as raw::c_int,
                 ) == 0;
                 if has_available_input {
