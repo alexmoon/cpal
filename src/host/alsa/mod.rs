@@ -526,7 +526,7 @@ struct StreamInner {
     period_len: usize,
 
     // Whether or not the hardware supports pausing the stream.
-    can_pause: bool,
+    _can_pause: bool,
 }
 
 // Assume that the ALSA library is built with thread safe option.
