@@ -8,10 +8,7 @@ use crate::{
     SupportedStreamConfigsError,
 };
 use std::cmp;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
-};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::vec::IntoIter as VecIntoIter;
 use traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -145,10 +142,7 @@ impl Device {
             Some(h) => h,
             None => alsa::pcm::PCM::new(&self.name, stream_type, false)?,
         };
-        let can_pause = {
-            let hw_params = set_hw_params_from_format(&handle, conf, sample_format)?;
-            hw_params.can_pause()
-        };
+        set_hw_params_from_format(&handle, conf, sample_format)?;
         let period_len = set_sw_params_from_format(&handle, conf, stream_type)?;
 
         let stream_inner = StreamInner {
@@ -156,8 +150,7 @@ impl Device {
             sample_format,
             num_channels: conf.channels as u16,
             period_len,
-            can_pause,
-            dropping: AtomicBool::new(false),
+            state: (Mutex::new(StreamState::Paused), Condvar::new()),
         };
 
         Ok(stream_inner)
@@ -357,6 +350,13 @@ impl Device {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamState {
+    Active,
+    Paused,
+    Dropping,
+}
+
 struct StreamInner {
     // The ALSA channel.
     channel: alsa::pcm::PCM,
@@ -370,11 +370,8 @@ struct StreamInner {
     // Minimum number of samples to put in the buffer.
     period_len: usize,
 
-    // Whether or not the hardware supports pausing the stream.
-    can_pause: bool,
-
-    // Whether or not the stream is being dropped.
-    dropping: AtomicBool,
+    // Whether the stream is active, paused, or being dropped.
+    state: (Mutex<StreamState>, Condvar),
 }
 
 // Assume that the ALSA library is built with thread safe option.
@@ -394,25 +391,18 @@ fn input_stream_worker(
     data_callback: &mut (dyn FnMut(&Data) + Send + 'static),
     error_callback: &mut (dyn FnMut(StreamError) + Send + 'static),
 ) {
-    match stream.channel.prepare() {
-        Ok(_) => (),
-        Err(err) => {
-            error_callback(err.into());
-            return;
-        }
-    }
-
+    let ignore_result = |_| {};
     match stream.sample_format {
         SampleFormat::I16 => match stream.channel.io_i16() {
-            Ok(io) => input_stream_worker_io(stream, io, data_callback, error_callback),
+            Ok(io) => ignore_result(input_stream_worker_io(stream, io, data_callback, error_callback)),
             Err(err) => error_callback(err.into()),
         },
         SampleFormat::U16 => match stream.channel.io_u16() {
-            Ok(io) => input_stream_worker_io(stream, io, data_callback, error_callback),
+            Ok(io) => ignore_result(input_stream_worker_io(stream, io, data_callback, error_callback)),
             Err(err) => error_callback(err.into()),
         },
         SampleFormat::F32 => match stream.channel.io_f32() {
-            Ok(io) => input_stream_worker_io(stream, io, data_callback, error_callback),
+            Ok(io) => ignore_result(input_stream_worker_io(stream, io, data_callback, error_callback)),
             Err(err) => error_callback(err.into()),
         },
     }
@@ -423,7 +413,7 @@ fn input_stream_worker_io<T: Default + Copy>(
     io: alsa::pcm::IO<'_, T>,
     data_callback: &mut (dyn FnMut(&Data) + Send + 'static),
     error_callback: &mut (dyn FnMut(StreamError) + Send + 'static),
-) {
+) -> Result<(), ()> {
     let channels = stream.num_channels as usize;
     let mut buffer = vec![T::default(); stream.period_len];
     let data = unsafe {
@@ -434,51 +424,36 @@ fn input_stream_worker_io<T: Default + Copy>(
         )
     };
     loop {
-        let mut buf = &mut *buffer;
-        while buf.len() > 0 {
-            match io.readi(buf) {
-                Ok(frames) => buf = &mut buf[(frames * channels)..],
-                Err(err) => {
-                    if let Some(errno) = err.errno() {
-                        match errno {
-                            nix::errno::Errno::EAGAIN => {
-                                stream.channel.wait(Some(100)).ok();
-                            }
-                            nix::errno::Errno::EPIPE
-                            | nix::errno::Errno::EINTR
-                            | nix::errno::Errno::ESTRPIPE => {
-                                match stream.channel.try_recover(err, true) {
-                                    Ok(()) => error_callback(
-                                        BackendSpecificError {
-                                            description: format!(
-                                                "read error: {} (recovered)",
-                                                errno
-                                            ),
-                                        }
-                                        .into(),
-                                    ),
-                                    Err(err) => {
-                                        error_callback(err.into());
-                                        return;
-                                    }
-                                }
-                            }
-                            _ => {
-                                if !stream.dropping.load(Ordering::Relaxed) {
-                                    error_callback(err.into());
-                                }
-                                return;
-                            }
-                        }
-                    } else {
-                        error_callback(err.into());
-                        return;
-                    }
+        let stream_state = {
+            let mut guard = stream.state.0.lock().unwrap();
+            // If paused, block until the state changes
+            while *guard == StreamState::Paused {
+                if stream.channel.state() == alsa::pcm::State::Running {
+                    // When pausing a Capture stream, drop any data still in the driver's buffer
+                    let _ = stream.channel.drop();
                 }
+                guard = stream.state.1.wait(guard).unwrap();
             }
-        }
+            *guard
+        };
 
-        data_callback(&data);
+        match stream_state {
+            StreamState::Active => {
+                // Fill buffer from the stream
+                let mut buf = &mut *buffer;
+                while buf.len() > 0 {
+                    let frames = io
+                        .readi(buf)
+                        .or_else(|err| handle_stream_io_error(stream, err, error_callback))?;
+                    buf = &mut buf[(frames * channels)..];
+                }
+
+                // Give data to the callback
+                data_callback(&data);
+            }
+            StreamState::Dropping => return Ok(()),
+            StreamState::Paused => unreachable!(),
+        }
     }
 }
 
@@ -487,25 +462,18 @@ fn output_stream_worker(
     data_callback: &mut (dyn FnMut(&mut Data) + Send + 'static),
     error_callback: &mut (dyn FnMut(StreamError) + Send + 'static),
 ) {
-    match stream.channel.prepare() {
-        Ok(_) => (),
-        Err(err) => {
-            error_callback(err.into());
-            return;
-        }
-    }
-
+    let ignore_result = |_| {};
     match stream.sample_format {
         SampleFormat::I16 => match stream.channel.io_i16() {
-            Ok(io) => output_stream_worker_io(stream, io, data_callback, error_callback),
+            Ok(io) => ignore_result(output_stream_worker_io(stream, io, data_callback, error_callback)),
             Err(err) => error_callback(err.into()),
         },
         SampleFormat::U16 => match stream.channel.io_u16() {
-            Ok(io) => output_stream_worker_io(stream, io, data_callback, error_callback),
+            Ok(io) => ignore_result(output_stream_worker_io(stream, io, data_callback, error_callback)),
             Err(err) => error_callback(err.into()),
         },
         SampleFormat::F32 => match stream.channel.io_f32() {
-            Ok(io) => output_stream_worker_io(stream, io, data_callback, error_callback),
+            Ok(io) => ignore_result(output_stream_worker_io(stream, io, data_callback, error_callback)),
             Err(err) => error_callback(err.into()),
         },
     }
@@ -516,7 +484,7 @@ fn output_stream_worker_io<T: Copy + Default>(
     io: alsa::pcm::IO<'_, T>,
     data_callback: &mut (dyn FnMut(&mut Data) + Send + 'static),
     error_callback: &mut (dyn FnMut(StreamError) + Send + 'static),
-) {
+) -> Result<(), ()> {
     let channels = stream.num_channels as usize;
     let mut buffer = vec![T::default(); stream.period_len];
     let mut data = unsafe {
@@ -528,51 +496,85 @@ fn output_stream_worker_io<T: Copy + Default>(
     };
 
     loop {
-        data_callback(&mut data);
+        let stream_state = {
+            let mut guard = stream.state.0.lock().unwrap();
+            // If paused, block until the state changes
+            while *guard == StreamState::Paused {
+                if stream.channel.state() == alsa::pcm::State::Running {
+                    // When pausing a Playback stream, allow data in the driver's buffer to continue to play until consumed
+                    let _ = stream.channel.drain();
+                }
+                guard = stream.state.1.wait(guard).unwrap();
+            }
+            *guard
+        };
 
-        let mut buf = &*buffer;
-        while buf.len() > 0 {
-            match io.writei(buf) {
-                Ok(frames) => buf = &buf[(frames * channels)..],
-                Err(err) => {
-                    if let Some(errno) = err.errno() {
-                        match errno {
-                            nix::errno::Errno::EAGAIN => {
-                                stream.channel.wait(Some(100)).ok();
+        match stream_state {
+            StreamState::Active => {
+                // Get data from the callback
+                data_callback(&mut data);
+
+                // Write the whole buffer to the stream
+                let mut buf = &*buffer;
+                while buf.len() > 0 {
+                    let frames = io
+                        .writei(buf)
+                        .or_else(|err| handle_stream_io_error(stream, err, error_callback))?;
+                    buf = &buf[(frames * channels)..];
+                }
+            }
+            StreamState::Dropping => return Ok(()),
+            StreamState::Paused => unreachable!(),
+        }
+    }
+}
+
+fn handle_stream_io_error(
+    stream: &StreamInner,
+    err: alsa::Error,
+    error_callback: &mut (dyn FnMut(StreamError) + Send + 'static),
+) -> Result<usize, ()> {
+    if let Some(errno) = err.errno() {
+        match errno {
+            nix::errno::Errno::EAGAIN => {
+                stream.channel.wait(Some(100)).ok();
+                Ok(0)
+            }
+            nix::errno::Errno::EBADFD => match stream.channel.prepare() {
+                Ok(()) => Ok(0),
+                Err(_) => {
+                    error_callback(err.into());
+                    Err(())
+                }
+            },
+            nix::errno::Errno::EPIPE | nix::errno::Errno::EINTR | nix::errno::Errno::ESTRPIPE => {
+                match stream.channel.try_recover(err, true) {
+                    Ok(()) => {
+                        error_callback(
+                            BackendSpecificError {
+                                description: format!("I/O error: {} (recovered)", errno),
                             }
-                            nix::errno::Errno::EPIPE
-                            | nix::errno::Errno::EINTR
-                            | nix::errno::Errno::ESTRPIPE => {
-                                match stream.channel.try_recover(err, true) {
-                                    Ok(()) => error_callback(
-                                        BackendSpecificError {
-                                            description: format!(
-                                                "write error: {} (recovered)",
-                                                errno
-                                            ),
-                                        }
-                                        .into(),
-                                    ),
-                                    Err(err) => {
-                                        error_callback(err.into());
-                                        return;
-                                    }
-                                }
-                            }
-                            _ => {
-                                if !stream.dropping.load(Ordering::Relaxed) {
-                                    error_callback(err.into());
-                                }
-                                return;
-                            }
-                        }
-                    } else {
+                            .into(),
+                        );
+                        Ok(0)
+                    }
+                    Err(err) => {
                         error_callback(err.into());
-                        return;
+                        Err(())
                     }
                 }
             }
+            _ => {
+                let stream_state = { *stream.state.0.lock().unwrap() };
+                if stream_state != StreamState::Dropping {
+                    error_callback(err.into());
+                }
+                Err(())
+            }
         }
+    } else {
+        error_callback(err.into());
+        Err(())
     }
 }
 
@@ -620,23 +622,26 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        self.inner.dropping.store(true, Ordering::Relaxed);
-        self.inner.channel.drop().ok();
+        {
+            let mut guard = self.inner.state.0.lock().unwrap();
+            *guard = StreamState::Dropping;
+            self.inner.state.1.notify_one();
+        }
+        let _ = self.inner.channel.drop();
         self.thread.take().unwrap().join().unwrap();
     }
 }
 
 impl StreamTrait for Stream {
     fn play(&self) -> Result<(), PlayStreamError> {
-        if self.inner.can_pause {
-            self.inner.channel.pause(false)?;
-        }
+        let mut guard = self.inner.state.0.lock().unwrap();
+        *guard = StreamState::Active;
+        self.inner.state.1.notify_one();
         Ok(())
     }
     fn pause(&self) -> Result<(), PauseStreamError> {
-        if self.inner.can_pause {
-            self.inner.channel.pause(true)?;
-        }
+        let mut guard = self.inner.state.0.lock().unwrap();
+        *guard = StreamState::Paused;
         Ok(())
     }
 }
