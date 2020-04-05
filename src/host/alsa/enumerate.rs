@@ -1,5 +1,6 @@
 use super::alsa;
 use super::Device;
+use std::sync::Mutex;
 use {BackendSpecificError, DevicesError};
 
 /// ALSA implementation for `Devices`.
@@ -48,19 +49,17 @@ impl Iterator for Devices {
                     };
 
                     // See if the device has an available output stream.
-                    let has_available_output = {
-                        let playback_handle = alsa::pcm::PCM::new(&name, alsa::Direction::Playback, true);
-                        playback_handle.is_ok()
-                    };
+                    let playback = alsa::pcm::PCM::new(&name, alsa::Direction::Playback, true).ok();
 
                     // See if the device has an available input stream.
-                    let has_available_input = {
-                        let capture_handle = alsa::pcm::PCM::new(&name, alsa::Direction::Capture, true);
-                        capture_handle.is_ok()
-                    };
+                    let capture = alsa::pcm::PCM::new(&name, alsa::Direction::Capture, true).ok();
 
-                    if has_available_output || has_available_input {
-                        return Some(Device(name));
+                    if playback.is_some() || capture.is_some() {
+                        return Some(Device {
+                            name,
+                            playback: Mutex::new(playback),
+                            capture: Mutex::new(capture),
+                        });
                     }
                 }
             }
@@ -70,12 +69,20 @@ impl Iterator for Devices {
 
 #[inline]
 pub fn default_input_device() -> Option<Device> {
-    Some(Device("default".to_owned()))
+    Some(Device {
+        name: "default".to_owned(),
+        playback: Mutex::new(None),
+        capture: Mutex::new(None),
+    })
 }
 
 #[inline]
 pub fn default_output_device() -> Option<Device> {
-    Some(Device("default".to_owned()))
+    Some(Device {
+        name: "default".to_owned(),
+        playback: Mutex::new(None),
+        capture: Mutex::new(None),
+    })
 }
 
 impl From<alsa::Error> for DevicesError {
