@@ -140,7 +140,7 @@ impl Device {
 
         let handle = match handle {
             Some(h) => h,
-            None => alsa::pcm::PCM::new(&self.name, stream_type, false)?,
+            None => alsa::pcm::PCM::new(&self.name, stream_type, true)?,
         };
         set_hw_params_from_format(&handle, conf, sample_format)?;
         let period_len = set_sw_params_from_format(&handle, conf, stream_type)?;
@@ -391,18 +391,17 @@ fn input_stream_worker(
     data_callback: &mut (dyn FnMut(&Data) + Send + 'static),
     error_callback: &mut (dyn FnMut(StreamError) + Send + 'static),
 ) {
-    let ignore_result = |_| {};
     match stream.sample_format {
         SampleFormat::I16 => match stream.channel.io_i16() {
-            Ok(io) => ignore_result(input_stream_worker_io(stream, io, data_callback, error_callback)),
+            Ok(io) => input_stream_worker_io(stream, io, data_callback, error_callback),
             Err(err) => error_callback(err.into()),
         },
         SampleFormat::U16 => match stream.channel.io_u16() {
-            Ok(io) => ignore_result(input_stream_worker_io(stream, io, data_callback, error_callback)),
+            Ok(io) => input_stream_worker_io(stream, io, data_callback, error_callback),
             Err(err) => error_callback(err.into()),
         },
         SampleFormat::F32 => match stream.channel.io_f32() {
-            Ok(io) => ignore_result(input_stream_worker_io(stream, io, data_callback, error_callback)),
+            Ok(io) => input_stream_worker_io(stream, io, data_callback, error_callback),
             Err(err) => error_callback(err.into()),
         },
     }
@@ -413,7 +412,7 @@ fn input_stream_worker_io<T: Default + Copy>(
     io: alsa::pcm::IO<'_, T>,
     data_callback: &mut (dyn FnMut(&Data) + Send + 'static),
     error_callback: &mut (dyn FnMut(StreamError) + Send + 'static),
-) -> Result<(), ()> {
+) {
     let channels = stream.num_channels as usize;
     let mut buffer = vec![T::default(); stream.period_len];
     let data = unsafe {
@@ -426,12 +425,15 @@ fn input_stream_worker_io<T: Default + Copy>(
     loop {
         let stream_state = {
             let mut guard = stream.state.0.lock().unwrap();
+
+            // When pausing a Capture stream, drop any data still in the driver's buffer
+            if *guard == StreamState::Paused && stream.channel.state() == alsa::pcm::State::Running
+            {
+                let _ = stream.channel.drop();
+            }
+
             // If paused, block until the state changes
             while *guard == StreamState::Paused {
-                if stream.channel.state() == alsa::pcm::State::Running {
-                    // When pausing a Capture stream, drop any data still in the driver's buffer
-                    let _ = stream.channel.drop();
-                }
                 guard = stream.state.1.wait(guard).unwrap();
             }
             *guard
@@ -442,16 +444,19 @@ fn input_stream_worker_io<T: Default + Copy>(
                 // Fill buffer from the stream
                 let mut buf = &mut *buffer;
                 while buf.len() > 0 {
-                    let frames = io
+                    match io
                         .readi(buf)
-                        .or_else(|err| handle_stream_io_error(stream, err, error_callback))?;
-                    buf = &mut buf[(frames * channels)..];
+                        .or_else(|err| handle_stream_io_error(stream, err, error_callback))
+                    {
+                        Ok(frames) => buf = &mut buf[(frames * channels)..],
+                        Err(()) => return,
+                    }
                 }
 
                 // Give data to the callback
                 data_callback(&data);
             }
-            StreamState::Dropping => return Ok(()),
+            StreamState::Dropping => return,
             StreamState::Paused => unreachable!(),
         }
     }
@@ -462,18 +467,17 @@ fn output_stream_worker(
     data_callback: &mut (dyn FnMut(&mut Data) + Send + 'static),
     error_callback: &mut (dyn FnMut(StreamError) + Send + 'static),
 ) {
-    let ignore_result = |_| {};
     match stream.sample_format {
         SampleFormat::I16 => match stream.channel.io_i16() {
-            Ok(io) => ignore_result(output_stream_worker_io(stream, io, data_callback, error_callback)),
+            Ok(io) => output_stream_worker_io(stream, io, data_callback, error_callback),
             Err(err) => error_callback(err.into()),
         },
         SampleFormat::U16 => match stream.channel.io_u16() {
-            Ok(io) => ignore_result(output_stream_worker_io(stream, io, data_callback, error_callback)),
+            Ok(io) => output_stream_worker_io(stream, io, data_callback, error_callback),
             Err(err) => error_callback(err.into()),
         },
         SampleFormat::F32 => match stream.channel.io_f32() {
-            Ok(io) => ignore_result(output_stream_worker_io(stream, io, data_callback, error_callback)),
+            Ok(io) => output_stream_worker_io(stream, io, data_callback, error_callback),
             Err(err) => error_callback(err.into()),
         },
     }
@@ -484,7 +488,7 @@ fn output_stream_worker_io<T: Copy + Default>(
     io: alsa::pcm::IO<'_, T>,
     data_callback: &mut (dyn FnMut(&mut Data) + Send + 'static),
     error_callback: &mut (dyn FnMut(StreamError) + Send + 'static),
-) -> Result<(), ()> {
+) {
     let channels = stream.num_channels as usize;
     let mut buffer = vec![T::default(); stream.period_len];
     let mut data = unsafe {
@@ -498,12 +502,15 @@ fn output_stream_worker_io<T: Copy + Default>(
     loop {
         let stream_state = {
             let mut guard = stream.state.0.lock().unwrap();
+
+            // When pausing a Playback stream, allow data in the driver's buffer to continue to play until consumed
+            if *guard == StreamState::Paused && stream.channel.state() == alsa::pcm::State::Running
+            {
+                let _ = stream.channel.drain();
+            }
+
             // If paused, block until the state changes
             while *guard == StreamState::Paused {
-                if stream.channel.state() == alsa::pcm::State::Running {
-                    // When pausing a Playback stream, allow data in the driver's buffer to continue to play until consumed
-                    let _ = stream.channel.drain();
-                }
                 guard = stream.state.1.wait(guard).unwrap();
             }
             *guard
@@ -517,13 +524,16 @@ fn output_stream_worker_io<T: Copy + Default>(
                 // Write the whole buffer to the stream
                 let mut buf = &*buffer;
                 while buf.len() > 0 {
-                    let frames = io
+                    match io
                         .writei(buf)
-                        .or_else(|err| handle_stream_io_error(stream, err, error_callback))?;
-                    buf = &buf[(frames * channels)..];
+                        .or_else(|err| handle_stream_io_error(stream, err, error_callback))
+                    {
+                        Ok(frames) => buf = &buf[(frames * channels)..],
+                        Err(()) => return,
+                    }
                 }
             }
-            StreamState::Dropping => return Ok(()),
+            StreamState::Dropping => return,
             StreamState::Paused => unreachable!(),
         }
     }
